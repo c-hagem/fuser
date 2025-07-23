@@ -70,17 +70,46 @@ struct UringQueue {
 
 impl UringQueue {
     fn new(qid: u32, queue_depth: u32, buffer_size: usize, fuse_fd: i32) -> io::Result<Self> {
+        info!(
+            "Creating UringQueue {} with depth={}, buffer_size={}, fuse_fd={}",
+            qid, queue_depth, buffer_size, fuse_fd
+        );
+
+        // Validate fuse_fd first
+        if fuse_fd < 0 {
+            error!("Invalid fuse_fd: {}", fuse_fd);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid fuse_fd",
+            ));
+        }
+
+        // Check if we can stat the fuse_fd
+        let mut stat_buf = unsafe { std::mem::zeroed() };
+        let stat_result = unsafe { libc::fstat(fuse_fd, &mut stat_buf) };
+        if stat_result != 0 {
+            let error = io::Error::last_os_error();
+            error!("fstat failed on fuse_fd {}: {}", fuse_fd, error);
+            return Err(error);
+        }
+        info!("fuse_fd {} is valid", fuse_fd);
+
         // Create event fd for shutdown signaling
         let event_fd = unsafe { eventfd(0, EFD_CLOEXEC) };
         if event_fd < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            error!("eventfd creation failed: {}", error);
+            return Err(error);
         }
+        info!("Created eventfd: {}", event_fd);
 
-        // Setup io_uring
-        let ring = IoUring::new(queue_depth + 1)?; // +1 for event fd polling
+        // Setup io_uring with specific parameters like libfuse
+        info!("Setting up io_uring with depth {}", queue_depth + 1);
 
-        // Register file descriptors
-        ring.submitter().register_files(&[fuse_fd, event_fd])?;
+        // Try different approaches based on what fails
+        let ring = Self::setup_io_uring(queue_depth + 1, fuse_fd, event_fd)?;
+
+        info!("io_uring setup successful for queue {}", qid);
 
         // Create entries
         let mut entries = Vec::with_capacity(queue_depth as usize);

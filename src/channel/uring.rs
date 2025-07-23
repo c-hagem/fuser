@@ -127,7 +127,80 @@ impl UringQueue {
             buffer_size,
         })
     }
+    fn setup_io_uring(depth: u32, fuse_fd: i32, event_fd: i32) -> io::Result<IoUring> {
+        // Try the simple approach first
+        info!("Trying simple IoUring::new({})", depth);
+        match IoUring::new(depth) {
+            Ok(ring) => {
+                info!("Basic io_uring setup successful");
 
+                // Try to register files
+                info!(
+                    "Registering files: fuse_fd={}, event_fd={}",
+                    fuse_fd, event_fd
+                );
+                match ring.submitter().register_files(&[fuse_fd, event_fd]) {
+                    Ok(_) => {
+                        info!("File registration successful");
+                        return Ok(ring);
+                    }
+                    Err(e) => {
+                        error!("File registration failed: {}", e);
+
+                        // Try with just one file
+                        info!("Trying to register only fuse_fd");
+                        match ring.submitter().register_files(&[fuse_fd]) {
+                            Ok(_) => {
+                                warn!("Only fuse_fd registered, eventfd registration failed");
+                                return Ok(ring);
+                            }
+                            Err(e2) => {
+                                error!("Even single file registration failed: {}", e2);
+                                return Err(e2);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Basic io_uring setup failed: {}", e);
+
+                // Try with builder and specific parameters
+                info!("Trying with IoUring::builder()");
+                match IoUring::builder().build(depth) {
+                    Ok(ring) => {
+                        info!("Builder-based setup successful");
+                        return Self::try_register_files(ring, fuse_fd, event_fd);
+                    }
+                    Err(e2) => {
+                        error!("Builder-based setup also failed: {}", e2);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn try_register_files(ring: IoUring, fuse_fd: i32, event_fd: i32) -> io::Result<IoUring> {
+        // Try different file registration approaches
+        info!("Attempting file registration");
+
+        if let Err(e) = ring.submitter().register_files(&[fuse_fd, event_fd]) {
+            warn!("Two-file registration failed: {}, trying alternatives", e);
+
+            // Try with just fuse_fd
+            if let Err(e2) = ring.submitter().register_files(&[fuse_fd]) {
+                error!("Single file registration also failed: {}", e2);
+                return Err(e2);
+            } else {
+                warn!("Only fuse_fd registered successfully");
+            }
+        } else {
+            info!("Both files registered successfully");
+        }
+
+        Ok(ring)
+    }
     fn prepare_register_sqes(&mut self) -> io::Result<()> {
         // Prepare SQEs for all entries
         for (idx, _entry) in self.entries.iter_mut().enumerate() {

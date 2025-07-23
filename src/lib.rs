@@ -44,7 +44,6 @@ pub use reply::{
 pub use request::Request;
 pub use session::{BackgroundSession, Session, SessionACL, SessionUnmounter};
 #[cfg(feature = "abi-7-28")]
-use std::cmp::max;
 #[cfg(feature = "abi-7-13")]
 use std::cmp::min;
 
@@ -75,7 +74,12 @@ const INIT_FLAGS: u64 = FUSE_ASYNC_READ | FUSE_CASE_INSENSITIVE | FUSE_VOL_RENAM
 const fn default_init_flags(#[allow(unused_variables)] capabilities: u64) -> u64 {
     #[cfg(not(feature = "abi-7-28"))]
     {
-        INIT_FLAGS
+        let flags = INIT_FLAGS;
+        #[cfg(feature = "io_uring")]
+        if capabilities & FUSE_URING != 0 {
+            flags |= FUSE_URING;
+        }
+        flags
     }
 
     #[cfg(feature = "abi-7-28")]
@@ -83,6 +87,10 @@ const fn default_init_flags(#[allow(unused_variables)] capabilities: u64) -> u64
         let mut flags = INIT_FLAGS;
         if capabilities & FUSE_MAX_PAGES != 0 {
             flags |= FUSE_MAX_PAGES;
+        }
+        #[cfg(feature = "io_uring")]
+        if capabilities & FUSE_URING != 0 {
+            flags |= FUSE_URING;
         }
         flags
     }
@@ -160,6 +168,10 @@ pub struct KernelConfig {
     time_gran: Duration,
     #[cfg(feature = "abi-7-40")]
     max_stack_depth: u32,
+    #[cfg(feature = "io_uring")]
+    io_uring_enabled: bool,
+    #[cfg(feature = "io_uring")]
+    io_uring_queue_depth: u32,
 }
 
 impl KernelConfig {
@@ -180,6 +192,10 @@ impl KernelConfig {
             time_gran: Duration::new(0, 1),
             #[cfg(feature = "abi-7-40")]
             max_stack_depth: 0,
+            #[cfg(feature = "io_uring")]
+            io_uring_enabled: false,
+            #[cfg(feature = "io_uring")]
+            io_uring_queue_depth: 32,
         }
     }
 
@@ -312,9 +328,59 @@ impl KernelConfig {
         }
     }
 
+    /// Enable or disable io_uring support
+    ///
+    /// When enabled, the filesystem will use io_uring for communication with the kernel
+    /// instead of the traditional read/write syscalls. This can improve performance
+    /// for high-throughput workloads.
+    ///
+    /// Returns the previous value.
+    #[cfg(feature = "io_uring")]
+    pub fn set_io_uring_enabled(&mut self, enabled: bool) -> bool {
+        let previous = self.io_uring_enabled;
+        self.io_uring_enabled = enabled;
+        if enabled {
+            self.requested |= FUSE_URING;
+        } else {
+            self.requested &= !FUSE_URING;
+        }
+        previous
+    }
+
+    /// Set the io_uring queue depth
+    ///
+    /// This controls how many concurrent requests can be outstanding per CPU core.
+    /// Higher values can improve performance but use more memory.
+    ///
+    /// On success returns the previous value. On error returns the nearest value which will succeed.
+    #[cfg(feature = "io_uring")]
+    pub fn set_io_uring_queue_depth(&mut self, depth: u32) -> Result<u32, u32> {
+        if depth == 0 {
+            return Err(1);
+        }
+        if depth > 4096 {
+            return Err(4096);
+        }
+        let previous = self.io_uring_queue_depth;
+        self.io_uring_queue_depth = depth;
+        Ok(previous)
+    }
+
+    /// Get the current io_uring queue depth
+    #[cfg(feature = "io_uring")]
+    pub fn io_uring_queue_depth(&self) -> u32 {
+        self.io_uring_queue_depth
+    }
+
+    /// Check if io_uring is enabled
+    #[cfg(feature = "io_uring")]
+    pub fn is_io_uring_enabled(&self) -> bool {
+        self.io_uring_enabled
+    }
+
     #[cfg(feature = "abi-7-28")]
     fn max_pages(&self) -> u16 {
-        ((max(self.max_write, self.max_readahead) - 1) / page_size::get() as u32) as u16 + 1
+        (self.max_write / page_size::get() as u32) as u16
     }
 }
 

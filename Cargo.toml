@@ -22,6 +22,7 @@ serde = { version = "1.0.102", features = ["std", "derive"], optional = true }
 smallvec = "1.6.1"
 zerocopy = { version = "0.8", features = ["derive"] }
 nix = { version = "0.29.0", features = ["fs", "user"] }
+io-uring = { version = "0.6", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11.7"
@@ -36,6 +37,7 @@ pkg-config = { version = "0.3.14", optional = true }
 
 [features]
 default = []
+io_uring = ["abi-7-40", "dep:io-uring"]
 libfuse = ["pkg-config"]
 serializable = ["serde"]
 macfuse-4-compat = []
@@ -88,3 +90,7 @@ required-features = ["abi-7-11"]
 [[example]]
 name = "passthrough"
 required-features = ["abi-7-40"]
+
+[[example]]
+name = "hello_uring"
+required-features = ["io_uring"]

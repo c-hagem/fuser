@@ -245,6 +245,14 @@ pub mod consts {
     pub const FUSE_INIT_RESERVED: u64 = 1 << 31; // reserved, do not use
     #[cfg(feature = "abi-7-40")]
     pub const FUSE_PASSTHROUGH: u64 = 1 << 37; // filesystem wants to use passthrough files
+    #[cfg(feature = "io_uring")]
+    pub const FUSE_URING: u64 = 1 << 38; // filesystem supports io_uring communication
+
+    // io_uring specific opcodes
+    #[cfg(feature = "io_uring")]
+    pub const FUSE_IO_URING_CMD_REGISTER: u32 = 0;
+    #[cfg(feature = "io_uring")]
+    pub const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 1;
 
     #[cfg(target_os = "macos")]
     pub const FUSE_ALLOCATE: u64 = 1 << 27;
@@ -918,6 +926,33 @@ pub struct fuse_init_out {
     pub max_stack_depth: u32,
     #[cfg(feature = "abi-7-40")]
     pub reserved: [u32; 6],
+}
+
+#[cfg(feature = "io_uring")]
+#[repr(C)]
+#[derive(Debug, IntoBytes, FromBytes, KnownLayout, Immutable)]
+pub struct fuse_uring_cmd_req {
+    pub commit_id: u64,
+    pub qid: u32,
+    pub flags: u32,
+    pub _reserved: [u32; 16],
+}
+
+#[cfg(feature = "io_uring")]
+#[repr(C)]
+#[derive(Debug, IntoBytes, FromBytes, KnownLayout, Immutable)]
+pub struct fuse_uring_ent_in_out {
+    pub commit_id: u64,
+    pub payload_sz: u32,
+    pub _reserved: [u32; 3],
+}
+
+#[cfg(feature = "io_uring")]
+#[repr(C)]
+#[derive(Debug)]
+pub struct fuse_uring_req_header {
+    pub in_out: fuse_in_header,
+    pub ring_ent_in_out: fuse_uring_ent_in_out,
 }
 
 #[cfg(feature = "abi-7-12")]

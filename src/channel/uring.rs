@@ -202,9 +202,13 @@ impl UringQueue {
         Ok(ring)
     }
     fn prepare_register_sqes(&mut self) -> io::Result<()> {
-        // Prepare SQEs for all entries
-        for (idx, _entry) in self.entries.iter_mut().enumerate() {
-            // Create the io_uring command for registration
+        info!("Preparing register SQEs for queue {}", self.qid);
+
+        // Prepare SQEs for all entries - following libfuse pattern exactly
+        for (idx, entry) in self.entries.iter_mut().enumerate() {
+            info!("Preparing SQE {} for queue {}", idx, self.qid);
+
+            // Create the command request data (like libfuse's fuse_uring_sqe_set_req_data)
             let cmd_req = fuse_uring_cmd_req {
                 commit_id: 0, // Not used for registration
                 qid: self.qid,
@@ -212,78 +216,148 @@ impl UringQueue {
                 _reserved: [0; 16],
             };
 
-            // Create the uring command SQE
-            let cmd_sqe = opcode::UringCmd16::new(types::Fixed(0), FUSE_IO_URING_CMD_REGISTER)
-                .cmd(cmd_req.as_cmd_bytes())
-                .build()
-                .user_data(idx as u64);
+            // Set up iovecs like libfuse does
+            let iovecs = [
+                libc::iovec {
+                    iov_base: entry.request_buffer.as_mut_ptr() as *mut c_void,
+                    iov_len: entry.request_buffer.len(),
+                },
+                libc::iovec {
+                    iov_base: entry.response_buffer.as_mut_ptr() as *mut c_void,
+                    iov_len: entry.response_buffer.len(),
+                },
+            ];
 
+            debug!(
+                "Setting up iovecs: req_buf_len={}, resp_buf_len={}",
+                iovecs[0].iov_len, iovecs[1].iov_len
+            );
+
+            // Get SQE and prepare it manually like libfuse
+            let sqe = self
+                .ring
+                .submission()
+                .available()
+                .next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No SQE available"))?;
+
+            // Manual SQE preparation following libfuse exactly
             unsafe {
-                self.ring.submission().push(&cmd_sqe.into()).map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("Failed to push SQE: {:?}", e))
-                })?;
+                // Basic SQE setup
+                sqe.set_opcode(io_uring::opcode::UringCmd16::CODE);
+                sqe.set_flags(io_uring::squeue::Flags::FIXED_FILE);
+                sqe.set_fd(types::Fixed(0)); // FUSE fd is index 0
+                sqe.set_user_data(idx as u64);
+
+                // Set command-specific fields
+                sqe.set_addr(iovecs.as_ptr() as u64);
+                sqe.set_len(2); // Number of iovecs
+                sqe.set_rw_flags(0);
+                sqe.set_ioprio(0);
+                sqe.set_off(0);
+
+                // Set the command op and data
+                sqe.set_cmd_op(FUSE_IO_URING_CMD_REGISTER);
+
+                // Copy command data to SQE cmd area
+                let cmd_bytes = cmd_req.as_cmd_bytes();
+                let sqe_cmd = sqe.cmd_mut();
+                sqe_cmd[..cmd_bytes.len()].copy_from_slice(&cmd_bytes);
             }
+
+            debug!("Prepared register SQE {} for queue {}", idx, self.qid);
         }
 
-        // Add event fd polling SQE for shutdown signaling
-        let poll_sqe = opcode::PollAdd::new(types::Fixed(1), POLLIN as u32)
-            .build()
-            .user_data(u64::MAX); // Special marker for event fd
+        // Add event fd polling SQE
+        info!("Adding eventfd poll SQE for queue {}", self.qid);
+        let poll_sqe = self
+            .ring
+            .submission()
+            .available()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No SQE available for poll"))?;
 
         unsafe {
-            self.ring.submission().push(&poll_sqe.into()).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to push poll SQE: {:?}", e),
-                )
-            })?;
+            poll_sqe.set_opcode(io_uring::opcode::PollAdd::CODE);
+            poll_sqe.set_flags(io_uring::squeue::Flags::FIXED_FILE);
+            poll_sqe.set_fd(types::Fixed(1)); // eventfd is index 1
+            poll_sqe.set_user_data(u64::MAX);
+            poll_sqe.set_poll_events(POLLIN as u32);
         }
 
         // Submit all SQEs
-        self.ring.submit()?;
+        info!(
+            "Submitting {} SQEs for queue {}",
+            self.entries.len() + 1,
+            self.qid
+        );
+        let submitted = self.ring.submit()?;
+        info!(
+            "Successfully submitted {} SQEs for queue {}",
+            submitted, self.qid
+        );
 
         Ok(())
     }
 
     fn handle_completion(&mut self, user_data: u64, res: i32) -> io::Result<Option<Vec<u8>>> {
-        debug!("Handling completion for queue");
+        debug!(
+            "Handling completion: user_data={}, result={}",
+            user_data, res
+        );
+
         if user_data == u64::MAX {
             // Event fd completion - shutdown signal
             if res > 0 {
+                info!("Received shutdown signal on eventfd");
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "Shutdown signal",
                 ));
             }
+            debug!("Eventfd completion with res={}", res);
             return Ok(None);
         }
 
         let entry_idx = user_data as usize;
         if entry_idx >= self.entries.len() {
+            error!(
+                "Invalid entry index: {} >= {}",
+                entry_idx,
+                self.entries.len()
+            );
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid entry index",
+                format!("Invalid entry index: {}", entry_idx),
             ));
         }
 
         if res < 0 {
             let err = io::Error::from_raw_os_error(-res);
+            error!(
+                "Completion error for entry {}: {} ({})",
+                entry_idx, err, res
+            );
+
             if err.kind() == io::ErrorKind::NotConnected {
-                // Normal during unmount
+                info!("Normal unmount completion");
                 return Ok(None);
             }
             return Err(err);
         }
 
+        info!(
+            "Successful completion for entry {}: {} bytes",
+            entry_idx, res
+        );
+
         let entry = &mut self.entries[entry_idx];
         entry.in_use = true;
 
-        // For now, just return a dummy request data
-        // In a real implementation, this would parse the actual FUSE request
+        // For now, just return dummy data - real implementation would parse FUSE request
         let request_data = vec![0u8; res as usize];
         Ok(Some(request_data))
     }
-
     fn commit_response(&mut self, entry_idx: usize, response: &[u8]) -> io::Result<()> {
         if entry_idx >= self.entries.len() {
             return Err(io::Error::new(
